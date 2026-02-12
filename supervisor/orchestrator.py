@@ -1,11 +1,19 @@
-"""Dynamic supervisor orchestrator - uses FMAPI tool calling to decide which agents to invoke."""
+"""LangGraph supervisor orchestrator - uses a StateGraph with ChatDatabricks to coordinate agents."""
 
 import asyncio
 import json
 import logging
-from typing import AsyncGenerator
-from openai import AsyncOpenAI
-from config import get_workspace_host, get_oauth_token, FMAPI_MODEL
+from typing import AsyncGenerator, Annotated, TypedDict
+
+from langchain_core.tools import tool
+from langchain_core.messages import AIMessage, ToolMessage, SystemMessage, HumanMessage
+from databricks_langchain import ChatDatabricks
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+from pydantic import BaseModel, Field
+
+from config import FMAPI_MODEL
 from agent_client import agents
 
 logger = logging.getLogger(__name__)
@@ -35,107 +43,62 @@ SUPERVISOR_SYSTEM_PROMPT = """You are a trip planning supervisor that coordinate
 - Be efficient - call independent agents simultaneously in a single response to minimize wait time.
 - After receiving agent results, write a well-structured final answer with markdown headers and bullet points."""
 
-AGENT_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "create_plan",
-            "description": "Announce which agents you will call and in what order. ALWAYS call this first before calling any agent tools.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "steps": {
-                        "type": "array",
-                        "description": "Ordered list of agents to call. Group parallel agents together.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "agent": {"type": "string", "enum": ["weather", "packing", "activities", "budget", "transport"]},
-                                "reason": {"type": "string", "description": "Brief reason for calling this agent"},
-                            },
-                            "required": ["agent", "reason"],
-                        },
-                    }
-                },
-                "required": ["steps"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "call_weather_agent",
-            "description": "Get weather forecast for a destination. Call when the question involves weather, outdoor plans, or when packing/activities agents need weather context.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task": {"type": "string", "description": "What weather information to gather"},
-                },
-                "required": ["task"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "call_packing_agent",
-            "description": "Get packing recommendations. Best when given weather context. Call after weather agent if both are needed.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task": {"type": "string", "description": "What packing advice is needed"},
-                    "context": {"type": "string", "description": "Weather or other context to inform packing recommendations"},
-                },
-                "required": ["task"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "call_activities_agent",
-            "description": "Get activity and sightseeing recommendations. Can adjust for weather if context is provided.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task": {"type": "string", "description": "What activity recommendations are needed"},
-                    "context": {"type": "string", "description": "Weather or other context to adjust recommendations"},
-                },
-                "required": ["task"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "call_budget_agent",
-            "description": "Get trip cost estimates. Independent - does not need weather context. Can be called in parallel with other agents.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task": {"type": "string", "description": "What cost information is needed"},
-                },
-                "required": ["task"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "call_transport_agent",
-            "description": "Get transportation information (flights, local transit, getting around). Independent - does not need weather context. Can be called in parallel with other agents.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task": {"type": "string", "description": "What transportation information is needed"},
-                },
-                "required": ["task"],
-            },
-        },
-    },
-]
 
-# Map tool names to agent keys
+# --- Tool definitions ---
+
+class PlanStep(BaseModel):
+    agent: str = Field(description="Agent to call: weather, packing, activities, budget, or transport")
+    reason: str = Field(description="Brief reason for calling this agent")
+
+
+class CreatePlanInput(BaseModel):
+    steps: list[PlanStep] = Field(description="Ordered list of agents to call with reasons")
+
+
+@tool(args_schema=CreatePlanInput)
+async def create_plan(steps: list[PlanStep]) -> str:
+    """Announce which agents you will call and in what order. ALWAYS call this first before calling any agent tools."""
+    agent_names = [s.agent for s in steps]
+    return f"Plan confirmed. Proceeding with agents: {', '.join(agent_names)}. Remember to call independent agents in parallel by issuing multiple tool calls in a single response."
+
+
+@tool
+async def call_weather_agent(task: str) -> str:
+    """Get weather forecast for a destination. Call when the question involves weather, outdoor plans, or when packing/activities agents need weather context."""
+    result = await agents["weather"].send_task(task)
+    return json.dumps({"text": result.get("result", "No result"), "tools_called": result.get("tools_called", []), "is_error": result.get("status") == "error"})
+
+
+@tool
+async def call_packing_agent(task: str, context: str = "") -> str:
+    """Get packing recommendations. Best when given weather context. Call after weather agent if both are needed."""
+    result = await agents["packing"].send_task(task, context)
+    return json.dumps({"text": result.get("result", "No result"), "tools_called": result.get("tools_called", []), "is_error": result.get("status") == "error"})
+
+
+@tool
+async def call_activities_agent(task: str, context: str = "") -> str:
+    """Get activity and sightseeing recommendations. Can adjust for weather if context is provided."""
+    result = await agents["activities"].send_task(task, context)
+    return json.dumps({"text": result.get("result", "No result"), "tools_called": result.get("tools_called", []), "is_error": result.get("status") == "error"})
+
+
+@tool
+async def call_budget_agent(task: str) -> str:
+    """Get trip cost estimates. Independent - does not need weather context. Can be called in parallel with other agents."""
+    result = await agents["budget"].send_task(task)
+    return json.dumps({"text": result.get("result", "No result"), "tools_called": result.get("tools_called", []), "is_error": result.get("status") == "error"})
+
+
+@tool
+async def call_transport_agent(task: str) -> str:
+    """Get transportation information (flights, local transit, getting around). Independent - does not need weather context. Can be called in parallel with other agents."""
+    result = await agents["transport"].send_task(task)
+    return json.dumps({"text": result.get("result", "No result"), "tools_called": result.get("tools_called", []), "is_error": result.get("status") == "error"})
+
+
+# --- LangGraph State and Graph ---
+
 TOOL_TO_AGENT = {
     "call_weather_agent": "weather",
     "call_packing_agent": "packing",
@@ -152,206 +115,172 @@ AGENT_DISPLAY_NAMES = {
     "transport": "Transport Agent",
 }
 
+ALL_TOOLS = [create_plan, call_weather_agent, call_packing_agent, call_activities_agent, call_budget_agent, call_transport_agent]
+
+
+class SupervisorState(TypedDict):
+    messages: Annotated[list, add_messages]
+
+
+# Build the LangGraph state graph
+model = ChatDatabricks(endpoint=FMAPI_MODEL)
+model_with_tools = model.bind_tools(ALL_TOOLS)
+
+
+async def supervisor_node(state):
+    """LLM decides next action - which agents to call or synthesize final answer."""
+    response = await model_with_tools.ainvoke(state["messages"])
+    return {"messages": [response]}
+
+
+def should_continue(state):
+    """Route: if the LLM made tool calls, go to tools node. Otherwise, end."""
+    last_message = state["messages"][-1]
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        return "tools"
+    return END
+
+
+# ToolNode handles parallel execution of multiple tool calls automatically
+tool_node = ToolNode(ALL_TOOLS)
+
+graph_builder = StateGraph(SupervisorState)
+graph_builder.add_node("supervisor", supervisor_node)
+graph_builder.add_node("tools", tool_node)
+graph_builder.add_edge(START, "supervisor")
+graph_builder.add_conditional_edges("supervisor", should_continue, {"tools": "tools", END: END})
+graph_builder.add_edge("tools", "supervisor")
+
+supervisor_graph = graph_builder.compile()
+
+
+# --- SSE Orchestration ---
 
 async def orchestrate(user_message: str) -> AsyncGenerator[dict, None]:
     """
-    Dynamic orchestration loop using FMAPI tool calling.
-    Supports parallel agent execution when the LLM issues multiple tool calls.
-    Yields SSE events for the frontend to display progress.
+    Run the LangGraph supervisor and yield SSE events for the frontend.
+    Uses astream with stream_mode='updates' to intercept each node's output.
     """
     yield {"type": "status", "message": "Planning which agents to use..."}
 
-    client = AsyncOpenAI(
-        api_key=get_oauth_token(),
-        base_url=f"{get_workspace_host()}/serving-endpoints",
-    )
-
-    messages = [
-        {"role": "system", "content": SUPERVISOR_SYSTEM_PROMPT},
-        {"role": "user", "content": user_message},
+    initial_messages = [
+        SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT),
+        HumanMessage(content=user_message),
     ]
 
     planned_agents = []
     completed_agents = []
 
-    max_turns = 15
-    for turn in range(max_turns):
-        try:
-            response = await client.chat.completions.create(
-                model=FMAPI_MODEL,
-                messages=messages,
-                tools=AGENT_TOOLS,
-                max_tokens=4096,
-            )
-        except Exception as e:
-            logger.error(f"FMAPI call failed: {e}")
-            yield {"type": "error", "error": f"Model API error: {e}"}
-            return
+    try:
+        async for chunk in supervisor_graph.astream(
+            {"messages": initial_messages},
+            stream_mode="updates",
+        ):
+            for node_name, state_update in chunk.items():
+                new_messages = state_update.get("messages", [])
 
-        choice = response.choices[0]
-        msg = choice.message
+                if node_name == "supervisor":
+                    for msg in new_messages:
+                        if not isinstance(msg, AIMessage):
+                            continue
 
-        if msg.tool_calls:
-            # Build assistant message
-            assistant_msg = {"role": "assistant", "content": msg.content or None, "tool_calls": []}
-            for tc in msg.tool_calls:
-                assistant_msg["tool_calls"].append({
-                    "id": tc.id, "type": "function",
-                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                })
-            messages.append(assistant_msg)
+                        if msg.tool_calls:
+                            # Separate plan calls from agent calls
+                            plan_calls = [tc for tc in msg.tool_calls if tc["name"] == "create_plan"]
+                            agent_calls = [tc for tc in msg.tool_calls if tc["name"] in TOOL_TO_AGENT]
 
-            # Categorize tool calls
-            plan_calls = []
-            agent_calls = []
-            unknown_calls = []
-            for tc in msg.tool_calls:
-                if tc.function.name == "create_plan":
-                    plan_calls.append(tc)
-                elif tc.function.name in TOOL_TO_AGENT:
-                    agent_calls.append(tc)
-                else:
-                    unknown_calls.append(tc)
+                            # Handle plan
+                            for tc in plan_calls:
+                                steps = tc.get("args", {}).get("steps", [])
+                                # Steps may be PlanStep objects or dicts
+                                step_dicts = []
+                                for s in steps:
+                                    if isinstance(s, dict):
+                                        step_dicts.append(s)
+                                    else:
+                                        step_dicts.append({"agent": s.agent, "reason": s.reason})
+                                planned_agents = [s["agent"] for s in step_dicts]
+                                logger.info(f"Plan: {planned_agents}")
+                                yield {
+                                    "type": "plan",
+                                    "steps": step_dicts,
+                                    "agents": planned_agents,
+                                }
 
-            # Handle plan calls
-            for tc in plan_calls:
-                tc_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
-                steps = tc_args.get("steps", [])
-                planned_agents = [s["agent"] for s in steps]
-                logger.info(f"Plan: {planned_agents}")
-                yield {
-                    "type": "plan",
-                    "steps": steps,
-                    "agents": planned_agents,
-                }
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": f"Plan confirmed. Proceeding with agents: {', '.join(planned_agents)}. Remember to call independent agents in parallel by issuing multiple tool calls in a single response.",
-                })
+                            # Handle agent calls - emit round_start + agent_start
+                            if agent_calls:
+                                agent_keys = [TOOL_TO_AGENT[tc["name"]] for tc in agent_calls]
 
-            # Handle unknown calls
-            for tc in unknown_calls:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": f"Unknown tool: {tc.function.name}",
-                })
+                                # Check for unplanned agents
+                                for ak in agent_keys:
+                                    if ak not in planned_agents:
+                                        planned_agents.append(ak)
+                                        yield {
+                                            "type": "plan_update",
+                                            "agents": planned_agents,
+                                            "added": ak,
+                                            "reason": f"Supervisor decided to also consult {AGENT_DISPLAY_NAMES[ak]}",
+                                        }
 
-            # Handle agent calls
-            if not agent_calls:
-                continue
+                                is_parallel = len(agent_calls) > 1
+                                yield {
+                                    "type": "round_start",
+                                    "agents": agent_keys,
+                                    "parallel": is_parallel,
+                                }
 
-            agent_keys = []
-            for tc in agent_calls:
-                agent_key = TOOL_TO_AGENT[tc.function.name]
-                agent_keys.append(agent_key)
-                if agent_key not in planned_agents:
-                    planned_agents.append(agent_key)
-                    yield {
-                        "type": "plan_update",
-                        "agents": planned_agents,
-                        "added": agent_key,
-                        "reason": f"Supervisor decided to also consult {AGENT_DISPLAY_NAMES[agent_key]}",
-                    }
+                                for tc in agent_calls:
+                                    ak = TOOL_TO_AGENT[tc["name"]]
+                                    task_text = tc.get("args", {}).get("task", "")
+                                    yield {
+                                        "type": "agent_start",
+                                        "agent": ak,
+                                        "task": task_text[:150],
+                                    }
 
-            is_parallel = len(agent_calls) > 1
+                        elif msg.content:
+                            # Final synthesis response (no tool calls)
+                            yield {"type": "synthesis_start"}
+                            yield {"type": "response", "text": msg.content}
 
-            # Emit round start so frontend knows the grouping
-            yield {
-                "type": "round_start",
-                "agents": agent_keys,
-                "parallel": is_parallel,
-            }
+                elif node_name == "tools":
+                    # Tool results - emit agent_result for each agent tool
+                    for msg in new_messages:
+                        if not isinstance(msg, ToolMessage):
+                            continue
 
-            # Emit agent_start for each agent in this round
-            for tc in agent_calls:
-                agent_key = TOOL_TO_AGENT[tc.function.name]
-                tc_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
-                task = tc_args.get("task", "")
-                yield {
-                    "type": "agent_start",
-                    "agent": agent_key,
-                    "task": task[:150],
-                }
+                        # Find which tool this result is for
+                        tool_name = msg.name if hasattr(msg, "name") else ""
+                        if tool_name not in TOOL_TO_AGENT:
+                            continue
 
-            if is_parallel:
-                # Run agents concurrently
-                logger.info(f"Running {len(agent_calls)} agents in parallel: {agent_keys}")
+                        ak = TOOL_TO_AGENT[tool_name]
+                        completed_agents.append(ak)
 
-                async def _call_agent(tc_inner):
-                    ak = TOOL_TO_AGENT[tc_inner.function.name]
-                    args = json.loads(tc_inner.function.arguments) if tc_inner.function.arguments else {}
-                    task_text = args.get("task", "")
-                    context_text = args.get("context", "")
-                    ac = agents.get(ak)
-                    if not ac:
-                        return (tc_inner, ak, f"Agent '{ak}' not available", True, [])
-                    res = await ac.send_task(task_text, context_text)
-                    return (
-                        tc_inner,
-                        ak,
-                        res.get("result", "No result"),
-                        res.get("status") == "error",
-                        res.get("tools_called", []),
-                    )
+                        # Parse the JSON result from our tool functions
+                        try:
+                            result_data = json.loads(msg.content)
+                            result_text = result_data.get("text", msg.content)
+                            tools_called = result_data.get("tools_called", [])
+                            is_error = result_data.get("is_error", False)
+                        except (json.JSONDecodeError, AttributeError):
+                            result_text = str(msg.content)
+                            tools_called = []
+                            is_error = False
 
-                results = await asyncio.gather(*[_call_agent(tc) for tc in agent_calls])
+                        yield {
+                            "type": "agent_result",
+                            "agent": ak,
+                            "result": result_text,
+                            "tools_called": tools_called if not is_error else [],
+                            "is_error": is_error,
+                        }
 
-                for (tc_r, ak, result_text, is_error, tools_called) in results:
-                    completed_agents.append(ak)
-                    yield {
-                        "type": "agent_result",
-                        "agent": ak,
-                        "result": result_text,
-                        "tools_called": tools_called if not is_error else [],
-                        "is_error": is_error,
-                    }
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc_r.id,
-                        "content": result_text if not is_error else f"ERROR: {result_text}",
-                    })
-            else:
-                # Single agent - run sequentially
-                tc = agent_calls[0]
-                agent_key = TOOL_TO_AGENT[tc.function.name]
-                tc_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
-                task = tc_args.get("task", "")
-                context = tc_args.get("context", "")
+    except Exception as e:
+        logger.error(f"Orchestration error: {e}")
+        yield {"type": "error", "error": f"Orchestration error: {e}"}
+        return
 
-                agent_client = agents.get(agent_key)
-                if not agent_client:
-                    result_text = f"Agent '{agent_key}' not available"
-                    is_error = True
-                    tools_called = []
-                else:
-                    result = await agent_client.send_task(task, context)
-                    result_text = result.get("result", "No result")
-                    is_error = result.get("status") == "error"
-                    tools_called = result.get("tools_called", [])
-
-                completed_agents.append(agent_key)
-                yield {
-                    "type": "agent_result",
-                    "agent": agent_key,
-                    "result": result_text,
-                    "tools_called": tools_called if not is_error else [],
-                    "is_error": is_error,
-                }
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result_text if not is_error else f"ERROR: {result_text}",
-                })
-
-            continue
-
-        else:
-            # Final text response from the model
-            final_text = msg.content or ""
-            yield {"type": "synthesis_start"}
-            yield {"type": "response", "text": final_text}
-            return
-
-    yield {"type": "error", "error": "Supervisor reached maximum turns without completing."}
+    if not any(ak in completed_agents for ak in TOOL_TO_AGENT.values()):
+        # No agents were called - might be a direct response
+        pass
