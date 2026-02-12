@@ -1,0 +1,6 @@
+command:
+  - "python"
+  - "server.py"
+env:
+  - name: MCP_ACTIVITIES_URL
+    value: "https://trip-mcp-activities-7474646787389664.aws.databricksapps.com"

@@ -1,0 +1,6 @@
+command:
+  - "python"
+  - "server.py"
+env:
+  - name: MCP_WEATHER_URL
+    value: "https://trip-mcp-weather-7474646787389664.aws.databricksapps.com"

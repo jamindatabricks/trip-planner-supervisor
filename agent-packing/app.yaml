@@ -1,0 +1,6 @@
+command:
+  - "python"
+  - "server.py"
+env:
+  - name: MCP_PACKING_URL
+    value: "https://trip-mcp-packing-7474646787389664.aws.databricksapps.com"

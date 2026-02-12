@@ -1,0 +1,6 @@
+command:
+  - "python"
+  - "server.py"
+env:
+  - name: MCP_BUDGET_URL
+    value: "https://trip-mcp-budget-7474646787389664.aws.databricksapps.com"

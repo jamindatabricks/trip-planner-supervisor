@@ -1,0 +1,6 @@
+command:
+  - "python"
+  - "server.py"
+env:
+  - name: MCP_TRANSPORT_URL
+    value: "https://trip-mcp-transport-7474646787389664.aws.databricksapps.com"

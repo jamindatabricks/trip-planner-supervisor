@@ -1,0 +1,14 @@
+command:
+  - "python"
+  - "server.py"
+env:
+  - name: AGENT_WEATHER_URL
+    value: "https://trip-agent-weather-7474646787389664.aws.databricksapps.com"
+  - name: AGENT_PACKING_URL
+    value: "https://trip-agent-packing-7474646787389664.aws.databricksapps.com"
+  - name: AGENT_ACTIVITIES_URL
+    value: "https://trip-agent-activities-7474646787389664.aws.databricksapps.com"
+  - name: AGENT_BUDGET_URL
+    value: "https://trip-agent-budget-7474646787389664.aws.databricksapps.com"
+  - name: AGENT_TRANSPORT_URL
+    value: "https://trip-agent-transport-7474646787389664.aws.databricksapps.com"
